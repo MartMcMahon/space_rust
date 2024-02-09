@@ -1,350 +1,338 @@
-use inquire::{MultiSelect, Select, Text};
-use serde::{Deserialize, Serialize};
-use std::fmt::{self, Display, Formatter};
-use std::fs::File;
-use std::io::Read;
+use libc::STDIN_FILENO;
+use std::{
+    io::{self, Read, Write},
+    thread,
+    time::Duration,
+};
+use termios::{tcsetattr, Termios, ECHO, ICANON, TCSANOW};
+use tokio::sync::{mpsc, Mutex};
+
+mod client;
+mod space;
+use client::Client;
+
+#[derive(Default)]
+struct AppState {
+    credits: i64,
+    contracts: Vec<space::Contract>,
+    selection_index: usize,
+}
+
+fn load_creds() -> String {
+    std::fs::read_to_string("auth.json").unwrap()
+}
 
 #[tokio::main]
 async fn main() {
-    // let name = Text::new("What is your name?").prompt();
+    let client = start();
+}
 
-    // match name {
-    //     Ok(name) => println!("Hello {}", name),
-    //     Err(_) => println!("An error happened when asking for your name, try again later."),
-    // }
+fn start() -> Client {
+    let mut state: Mutex<AppState> = Mutex::new(AppState::default());
+    print!("loading credentials from disk");
+    let (tx, mut rx) = mpsc::channel(1);
 
-    let saved_agent = read_auth();
-    println!("creating client");
-    let api = Api::new();
+    thread::spawn(move || {
+        let creds = load_creds();
+        tx.blocking_send(creds).unwrap();
+    });
 
-    let agent_res = api.view_agent(&saved_agent).await.unwrap();
-
-    println!("{:?}", agent_res);
-
-    println!("fetching contracts");
-    let contracts_res: ContractsResponse = api.fetch_contracts(&saved_agent).await.unwrap();
-
-    for contract in contracts_res.data {
-        let contract: Contract = contract.into();
-        println!("{}", contract);
+    let client: Client;
+    loop {
+        match rx.try_recv() {
+            Ok(creds) => {
+                // println!("creds loaded: {:?}", creds);
+                let creds = serde_json::from_str(&creds).unwrap();
+                client = Client::new(creds);
+                break;
+            }
+            Err(_) => {}
+        }
+        print!(".");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(500));
     }
 
-    let main_menu = Select::new(
-        ">",
-        [
-            "ships",
-            "loans",
-            "systems",
-            "structures",
-            "upgrades",
-            "goods",
-        ]
-        .to_vec(),
-    )
-    .prompt();
-    match main_menu {
-        Ok(main_menu) => match main_menu {
-            "ships" => ships_menu(api, &saved_agent).await,
-            // "loans" => loans_menu(),
-            "systems" => systems_menu(api, &saved_agent).await,
-            // "structures" => structures_menu(),
-            // "upgrades" => upgrades_menu(),
-            // "goods" => goods_menu(),
-            _ => panic!("invalid option"),
-        },
-        Err(_) => println!("An error happened when asking for your name, try again later."),
-    };
-}
+    print!("\n\nfetching agent data");
+    let (tx, mut rx) = mpsc::channel(1);
+    let c = client.clone();
+    thread::spawn(move || {
+        let user = c.get_user().unwrap();
+        tx.blocking_send(user.to_string()).unwrap();
+    });
 
-async fn systems_menu(api: Api, agent: &Agent) {
-    println!("fetching systems...");
-    let systems = api.fetch_systems(&agent).await.unwrap();
+    loop {
+        match rx.try_recv() {
+            Ok(user) => {
+                println!("\n\n--- user info ---");
+                println!("{}", user);
+                break;
+            }
+            Err(_) => {}
+        }
+        print!(".");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(200));
+    }
 
-    let s = Select::new(">systems", systems.data.clone()).prompt();
-
-    println!("{:?}", &s);
-}
-
-async fn ships_menu(api: Api, agent: &Agent) {
-    let ships = api.fetch_ships(&agent).await.unwrap();
-
-    let s = Select::new(">ships", ships.data.clone()).prompt();
-    println!("{:?}", &s.unwrap().details());
-}
-
-// search
-// let waypoint_shipyard_res = api
-//     .search_waypoint(agent, "X1-RP15".to_string(), "SHIPYARD".to_string())
-//     .await;
-
-// println!("{:?}", waypoint_shipyard_res);
-// }
-
-fn read_auth() -> Agent {
-    read_auth_file("auth.json".to_string()).unwrap()
-}
-
-fn read_auth_file(filename: String) -> Result<Agent, std::io::Error> {
-    println!("reading {filename}");
-    let mut file = File::open(filename)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    Ok(serde_json::from_str(&contents)?)
-}
-
-#[derive(Deserialize, Debug)]
-struct Agent {
-    callsign: String,
-    token: String,
-}
-
-struct Api {
-    client: reqwest::Client,
-    url: String,
-}
-impl Api {
-    fn new() -> Api {
-        Api {
-            client: reqwest::Client::new(),
-            url: "https://api.spacetraders.io/v2".to_string(),
+    let mut prompter = Prompter::new();
+    loop {
+        // println!("name: {}", user.name);
+        let nav = main_menu(&mut prompter);
+        match nav {
+            b'c' => contracts_menu(&mut state, &mut prompter, &client),
+            b's' => println!("ships"),
+            b'y' => println!("systems"),
+            b'q' => break,
+            27 => break,
+            _ => println!("Invalid input"),
         }
     }
 
-    async fn view_agent(&self, agent: &Agent) -> Result<serde_json::Value, reqwest::Error> {
-        let url = format!("{}/my/agent", self.url);
-        let res = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", agent.token))
-            .send()
-            .await?;
-        let agent_res: serde_json::Value = res.json().await?;
-        Ok(agent_res)
-    }
-
-    async fn fetch_contracts(&self, agent: &Agent) -> Result<ContractsResponse, reqwest::Error> {
-        let url = format!("{}/my/contracts", self.url);
-        let res = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", agent.token))
-            .send()
-            .await?;
-        let contracts_res: ContractsResponse = res.json().await?;
-        Ok(contracts_res)
-    }
-
-    async fn search_waypoint(
-        &self,
-        agent: &Agent,
-        system: String,
-        traits: String,
-    ) -> Result<serde_json::Value, reqwest::Error> {
-        let url = format!(
-            "{}/systems/{}/waypoints?traits={}",
-            self.url, system, traits
-        );
-        let res = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", agent.token))
-            .send()
-            .await?;
-
-        println!("{:?}", res.text().await?);
-        Ok(serde_json::Value::Null)
-        // let query_waypoint_traits_res: serde_json::Value = res.json().await?;
-        // Ok(query_waypoint_traits_res)
-        // }
-    }
-
-    async fn fetch_systems(&self, agent: &Agent) -> Result<SystemsResponse, anyhow::Error> {
-        let url = format!("{}/systems", self.url);
-        let res = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", agent.token))
-            .send()
-            .await?;
-
-        let res: SystemsResponse = res.json().await?;
-        Ok(res)
-    }
-    async fn fetch_ships(&self, agent: &Agent) -> Result<ShipsResponse, anyhow::Error> {
-        let url = format!("{}/my/ships", self.url);
-        let res = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", agent.token))
-            .send()
-            .await?;
-
-        let res: ShipsResponse = res.json().await?;
-        Ok(res)
-    }
+    client
 }
 
-#[derive(Deserialize, Debug)]
-struct ContractsResponse {
-    data: Vec<Contract>,
-    meta: Meta,
-}
+fn contracts_menu(state: &mut Mutex<AppState>, prompter: &mut Prompter, client: &Client) {
+    let (tx, mut rx) = mpsc::channel(1);
+    let c = client.clone();
+    thread::spawn(move || {
+        let contracts = c.get_contracts().unwrap();
+        tx.blocking_send(contracts).unwrap();
+    });
 
-#[derive(Deserialize, Serialize, Debug)]
-struct Contract {
-    id: String,
-    #[serde(rename = "factionSymbol")]
-    faction_symbol: String,
-    #[serde(rename = "type")]
-    contract_type: String,
-    terms: serde_json::Value, // Terms,
-    accepted: bool,
-    fulfilled: bool,
-    expiration: String,
-    #[serde(rename = "deadlineToAccept")]
-    deadline_to_accept: String,
-}
-impl Display for Contract {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let s = format!(
-            "id: {}\n\
-            faction: {}\n\
-            type: {}\n\
-            accepted: {}\n\
-            fulfilled: {}\n\
-            expiration: {}\n\
-            deadline to accept: {}\n\
-            ",
-            self.id,
-            self.faction_symbol,
-            self.contract_type,
-            self.accepted,
-            self.fulfilled,
-            self.expiration,
-            self.deadline_to_accept
-        );
-        write!(f, "{}", s)
+    loop {
+        match rx.try_recv() {
+            Ok(contracts) => {
+                state.get_mut().contracts = contracts;
+                break;
+            }
+            Err(_) => {}
+        }
+        print!(".");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let state = state.get_mut();
+    state.contracts.push(space::Contract {
+        id: "123".to_string(),
+        contract_type: "test".to_string(),
+        faction_symbol: "test".to_string(),
+        accepted: false,
+        fulfilled: false,
+        expiration: "test".to_string(),
+        deadline_to_accept: "test".to_string(),
+        terms: serde_json::Value::Null,
+    });
+    loop {
+        println!("\n=== contracts ({}) ===", state.contracts.len());
+        state.contracts.iter().enumerate().for_each(|(i, c)| {
+            if i == state.selection_index {
+                print!(
+                    "
+===============
+| faction: {}
+| type: {}
+| accepted: {}
+| fulfilled: {}
+| expiration: {}
+| deadline to accept: {}
+===============
+",
+                    c.faction_symbol,
+                    c.contract_type,
+                    c.accepted,
+                    c.fulfilled,
+                    c.expiration,
+                    c.deadline_to_accept
+                );
+            } else {
+                print!("id: {}", c.id);
+            }
+        });
+
+        // let s = format!("\n=== contracts ({}) ===", num);
+
+        let nav = prompter.read_menu_input("");
+        match nav {
+            MenuInput::Up => {
+                if state.selection_index > 0 {
+                    state.selection_index -= 1;
+                }
+            }
+            MenuInput::Down => {
+                if state.selection_index < state.contracts.len() - 1 {
+                    state.selection_index += 1;
+                }
+            }
+            MenuInput::Enter => {
+                let mut prompter = Prompter::new();
+                single_contract_menu(
+                    &state.contracts[state.selection_index],
+                    client,
+                    &mut prompter,
+                );
+            }
+            MenuInput::Escape => {
+                break;
+            }
+            _ => {}
+        }
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct SystemsResponse {
-    data: Vec<System>,
-    meta: Meta,
-}
+fn single_contract_menu(contract: &space::Contract, client: &Client, prompter: &mut Prompter) {
+    let contract = contract.clone();
+    let nav = prompter.read_single_char("\naccept? (y/n)").unwrap();
+    match nav {
+        b'y' => {
+            let (tx, mut rx) = mpsc::channel(1);
+            let client = client.clone();
+            thread::spawn(move || {
+                let accept_contract_res = client.accept_contract(&contract.id.clone());
+                println!("{:?}", accept_contract_res);
+                tx.blocking_send(accept_contract_res).unwrap();
+            });
 
-#[derive(Clone, Deserialize, Debug)]
-struct System {
-    symbol: String,
-    #[serde(rename = "sectorSymbol")]
-    sector_symbol: String,
-    #[serde(rename = "type")]
-    system_type: String,
-    x: i32,
-    y: i32,
-    waypoints: Vec<Waypoint>,
-    factions: Vec<serde_json::Value>,
-}
-impl Display for System {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let s = format!("{}", self.symbol,);
-        write!(f, "{}", s)
+            loop {
+                match rx.try_recv() {
+                    Ok(accept_contract_res) => {
+                        println!("accepted");
+                        break;
+                    }
+                    Err(_) => {}
+                }
+                print!(".");
+                std::io::stdout().flush().unwrap();
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+        b'n' => {}
+        _ => println!("Invalid input"),
     }
 }
 
-#[derive(Clone, Deserialize, Debug)]
-struct Waypoint {
-    symbol: String,
-    #[serde(rename = "type")]
-    waypoint_type: String,
-    x: i32,
-    y: i32,
-    orbitals: Vec<serde_json::Value>,
-}
+fn systems_menu(client: Client, prompter: &mut Prompter) {
+    let (tx, mut rx) = mpsc::channel(1);
+    let client = client.clone();
+    thread::spawn(move || {
+        let systems = client.get_systems().unwrap();
+        tx.blocking_send(systems).unwrap();
+    });
 
-#[derive(Deserialize, Debug)]
-struct ShipsResponse {
-    data: Vec<Ship>,
-    meta: Meta,
-}
-
-#[derive(Clone, Deserialize, Debug)]
-struct Ship {
-    symbol: String,
-    nav: serde_json::Value,
-    crew: serde_json::Value,
-    fuel: serde_json::Value,
-    cooldown: serde_json::Value,
-    frame: serde_json::Value,
-    reactor: serde_json::Value,
-    engine: serde_json::Value,
-    modules: serde_json::Value,
-    mounts: serde_json::Value,
-    registration: serde_json::Value,
-    cargo: serde_json::Value,
-}
-impl Display for Ship {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let s = format!("{}", self.symbol,);
-        write!(f, "{}", s)
-    }
-}
-impl Ship {
-    fn details(&self) {
-        let s = format!(
-            "symbol: {}\n\
-            crew: {}\n\
-            fuel: {}\n\
-            cooldown: {}\n\
-            engine: {}\n\
-            mounts: {}\n\
-            cargo: {}\n\
-            ",
-            self.symbol,
-            // self.nav,
-            self.crew,
-            self.fuel,
-            self.cooldown,
-            // self.frame,
-            // self.reactor,
-            self.engine,
-            // self.modules,
-            self.mounts,
-            // self.registration,
-            self.cargo,
-        );
-        println!("{}", s);
+    loop {
+        match rx.try_recv() {
+            Ok(systems) => {
+                println!("systems: {:?}", systems);
+                break;
+            }
+            Err(_) => {}
+        }
+        print!(".");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
-// {
-//       "id": "clreq7vxy5lhbs60cfo6891fa",
-//       "factionSymbol": "COSMIC",
-//       "type": "PROCUREMENT",
-//       "terms": {
-//         "deadline": "2024-01-22T09:32:13.540Z",
-//         "payment": {
-//           "onAccepted": 1247,
-//           "onFulfilled": 9378
-//         },
-//         "deliver": [
-//           {
-//             "tradeSymbol": "IRON_ORE",
-//             "destinationSymbol": "X1-KY62-H52",
-//             "unitsRequired": 53,
-//             "unitsFulfilled": 0
-//           }
-//         ]
-//       },
-//       "accepted": false,
-//       "fulfilled": false,
-//       "expiration": "2024-01-16T09:32:13.540Z",
-//       "deadlineToAccept": "2024-01-16T09:32:13.540Z"
-//     }
+fn ships_menu(prompter: &mut Prompter) {
+    let s = "=== ships ===";
+    // loop through ships
+    // l -- list ships
+    // q -- quit
+    //  >"#;
 
-#[derive(Deserialize, Debug)]
-struct Meta {
-    total: u32,
-    page: u32,
-    limit: u32,
+    let nav = prompter.read_single_char(s).unwrap();
+    match nav {
+        b'l' => {}
+        b'q' => {}
+        _ => println!("Invalid input"),
+    }
+}
+
+fn main_menu(prompter: &mut Prompter) -> u8 {
+    let s = r#"
+|==== main menu ====|
+c -- contracts
+s -- ships
+y -- systems
+q -- quit
+
+ >"#;
+    return prompter.read_single_char(s).unwrap();
+}
+
+struct Prompter {
+    stdin: i32,
+    stdout: io::Stdout,
+    reader: io::Stdin,
+    buffer: [u8; 1],
+}
+impl Prompter {
+    fn new() -> Prompter {
+        let stdin = STDIN_FILENO;
+        let termios = Termios::from_fd(stdin).unwrap();
+        let mut new_termios = termios.clone(); // make a mutable copy of termios
+        let stdout = io::stdout();
+        let reader = io::stdin();
+        let buffer = [0; 1];
+
+        new_termios.c_lflag &= !(ICANON | ECHO); // no echo and canonical mode
+        tcsetattr(stdin, TCSANOW, &mut new_termios).unwrap();
+
+        Prompter {
+            stdin,
+            stdout,
+            reader,
+            buffer,
+        }
+    }
+    fn read_single_char(&mut self, msg: &str) -> io::Result<u8> {
+        print!("{}", msg);
+        self.stdout.lock().flush().unwrap();
+        self.reader.read_exact(&mut self.buffer).unwrap();
+        // tcsetattr(stdin, TCSANOW, &termios).unwrap();
+        Ok(self.buffer[0])
+    }
+
+    fn read_menu_input(&mut self, msg: &str) -> MenuInput {
+        let mut buffer = [0; 3];
+        print!("{}", msg);
+        self.stdout.lock().flush().unwrap();
+        self.reader.read(&mut buffer).unwrap();
+        match buffer[0] {
+            b'k' => MenuInput::Up,
+            b'j' => MenuInput::Down,
+            b'h' => MenuInput::Left,
+            b'l' => MenuInput::Right,
+            10 => MenuInput::Enter,
+            27 => {
+                if buffer[1] == 91 {
+                    return match buffer[2] {
+                        65 => MenuInput::Up,
+                        66 => MenuInput::Down,
+                        67 => MenuInput::Right,
+                        68 => MenuInput::Left,
+                        _ => MenuInput::Escape,
+                    };
+                } else {
+                    return MenuInput::Escape;
+                }
+            }
+            _ => MenuInput::Escape,
+        }
+    }
+}
+
+enum MenuInput {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Escape,
+}
+
+enum ContractMenuResult {
+    Accept,
+    Quit,
 }
