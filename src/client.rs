@@ -45,7 +45,7 @@ impl Client {
         Ok(contracts.data)
     }
 
-    pub fn accept_contract(&self, contract_id: &str) -> Result<(), reqwest::Error> {
+    pub fn accept_contract(&self, contract_id: &str) -> Result<serde_json::Value, reqwest::Error> {
         println!("accepting contract: {}", contract_id);
         let url = Client::url(("/my/contracts/".to_owned() + contract_id + "/accept").as_str());
         println!("url: {}", url);
@@ -60,7 +60,8 @@ impl Client {
             .unwrap();
         println!("{:?}", res);
         // let accept = res.json::<SingleContractResponse>().unwrap();
-        Ok(())
+        // this works, it just throws a 400 status code if contract is already accepted
+        Ok(res.json().unwrap())
     }
 
     pub fn get_systems(&self) -> Result<Vec<space::System>, reqwest::Error> {
