@@ -92,6 +92,10 @@ fn start() -> Client {
     client
 }
 
+fn clear_screen() {
+    println!("\x1b[2J");
+}
+
 fn contracts_menu(state: &mut Mutex<AppState>, prompter: &mut Prompter, client: &Client) {
     let (tx, mut rx) = mpsc::channel(1);
     let c = client.clone();
